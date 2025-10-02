@@ -1,0 +1,64 @@
+# Multi-stage build for production - v2
+FROM node:18-alpine AS frontend-build
+
+WORKDIR /app/frontend
+COPY frontend/package*.json ./
+# Install ALL dependencies including dev dependencies (TypeScript, Vite, etc.)
+RUN npm ci --legacy-peer-deps
+COPY frontend/ ./
+RUN npm run build
+
+FROM python:3.9-slim AS backend-build
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies with correct versions
+COPY backend/requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY rasa/requirements.txt ./rasa-requirements.txt
+RUN pip install --no-cache-dir -r rasa-requirements.txt
+
+# Copy application code
+COPY backend/ ./backend/
+COPY rasa/ ./rasa/
+COPY database/ ./database/
+
+# Copy built frontend
+COPY --from=frontend-build /app/frontend/dist ./frontend/dist
+
+# Create non-root user FIRST
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+
+# TRAIN MODEL AS NON-ROOT USER (Rasa 3.x compatible)
+USER appuser
+RUN cd rasa && \
+    echo "===========================================" && \
+    echo "🚂 Starting Rasa Training..." && \
+    echo "===========================================" && \
+    rasa train --domain data/domain.yml --data data --out models --fixed-model-name current && \
+    echo "===========================================" && \
+    echo "✅ Training Complete! Verifying model..." && \
+    echo "===========================================" && \
+    ls -lah models/ && \
+    echo "Model file details:" && \
+    ls -lh models/current.tar.gz && \
+    echo "==========================================="
+
+# Expose port (only 8000 for Render)
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Start command with comprehensive logging
+CMD ["sh", "-c", "echo '==========================================' && echo 'STARTING HEALTHCARE CHATBOT SERVICES' && echo '==========================================' && echo '' && echo 'Environment Check:' && echo \"Working Directory: $(pwd)\" && echo \"User: $(whoami)\" && echo \"Python Version: $(python --version)\" && echo '' && echo 'Rasa Models:' && ls -lah /app/rasa/models/ && echo '' && if [ -f /app/rasa/models/current.tar.gz ]; then echo 'Model exists: current.tar.gz' && ls -lh /app/rasa/models/current.tar.gz; else echo 'ERROR: Model NOT found!' && exit 1; fi && echo '' && echo '==========================================' && echo 'Starting Rasa Action Server (port 5055)' && echo '==========================================' && cd /app/rasa && rasa run actions --actions actions --port 5055 > /tmp/rasa-actions.log 2>&1 & ACTION_PID=$! && echo \"Rasa Actions PID: $ACTION_PID\" && sleep 12 && if kill -0 $ACTION_PID 2>/dev/null; then echo 'Rasa Actions: RUNNING'; else echo 'Rasa Actions: FAILED' && cat /tmp/rasa-actions.log && exit 1; fi && echo '' && echo '==========================================' && echo 'Starting Rasa Core Server (port 5005)' && echo '==========================================' && echo 'Model: models/current.tar.gz' && rasa run --enable-api --cors '*' --port 5005 --model models/current.tar.gz > /tmp/rasa-core.log 2>&1 & RASA_PID=$! && echo \"Rasa Core PID: $RASA_PID\" && sleep 20 && if kill -0 $RASA_PID 2>/dev/null; then echo 'Rasa Core: RUNNING'; else echo 'Rasa Core: FAILED' && cat /tmp/rasa-core.log && exit 1; fi && echo '' && echo '==========================================' && echo 'Starting FastAPI Backend (port 8000)' && echo '==========================================' && cd /app/backend && ps aux | grep -E 'rasa|PID' && echo '' && echo 'Backend launching...' && echo '==========================================' && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --log-level info"]
